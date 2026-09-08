@@ -67,7 +67,21 @@ def test_grounding_check():
     assert not ingest.is_grounded("FY2024 revenue was about 7.2 billion rupees", src)
     # and a rewritten number
     assert not ingest.is_grounded("was Rs. 7,225.30 million", src)
-    assert not ingest.is_grounded("short", src), "too short to be evidence"
+    assert not ingest.is_grounded("xy", src), "too short to be evidence"
+
+    # Slide decks and tables give short but perfectly good evidence. A 15-char
+    # floor rejected 73% of valid facts on the real Delhivery deck, so the bar is
+    # unambiguity: a short quote must occur exactly once in the chunk.
+    slide = ("FY24 performance YoY: 29.8% Rs 8,142 Cr revenue from services "
+             "YoY: 12.7%(2) 740 mn express parcel shipments 7,054 7,224 8,142")
+    assert ingest.is_grounded("YoY: 29.8%", slide), "unique short quote is evidence"
+    assert ingest.is_grounded("7,054", slide)
+    assert ingest.is_grounded("YoY: 12.7%(2)", slide)
+    # 8,142 appears twice here, so on its own it does not pin anything down.
+    assert not ingest.is_grounded("8,142", slide), "ambiguous short quote is not"
+    # ...but a long quote may legitimately repeat.
+    twice = "Revenue from operations grew. Revenue from operations grew."
+    assert ingest.is_grounded("Revenue from operations grew.", twice)
 
 
 def test_value_num_is_recomputed_not_trusted():

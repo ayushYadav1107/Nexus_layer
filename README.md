@@ -1,4 +1,4 @@
-# Fact Knowledge Layer
+# Nexus Layer
 
 Upload PDFs. The system extracts atomic facts, pins each one to a verbatim quote on a
 specific page, and cross-references every new fact against everything already stored —
@@ -11,19 +11,31 @@ context** (period, scope, units, vintage).
 
 Requirements: Python 3.11+, Node 18+, and a model for each of the two roles.
 
-The default configuration runs **extraction locally on Ollama** (free, unlimited) and
-**judging on the Gemini free tier** (far fewer calls, and the reasoning that matters).
-Either role can be pointed anywhere — see Configuration.
+Both roles default to the **Gemini free tier** — a smaller model for extraction (the
+many calls) and a stronger one for judging (the calls that decide the answer). Either
+role can be pointed at Ollama or Anthropic instead; see Configuration.
 
-**Models**
+**Configure once**
 
 ```bash
-# extraction, local and free
-ollama pull llama3.1:8b
-
-# judging: free key from https://aistudio.google.com/apikey
-export GEMINI_API_KEY=...                  # PowerShell: $env:GEMINI_API_KEY="..."
+cd backend
+cp .env.example .env
 ```
+
+Then put a free key from <https://aistudio.google.com/apikey> on the `GEMINI_API_KEY=`
+line. `.env` is gitignored and is read on every start, so this survives new terminals —
+shell variables do not, and forgetting to re-export them is how one run silently spent
+47 minutes producing nothing.
+
+**Check both models answer before ingesting anything:**
+
+```bash
+python check_models.py
+```
+
+Being listed by `python check_models.py --list` does **not** mean your key has free quota
+for a model — `gemini-3.8-flash` lists fine and 429s on every call. Verified working on a
+free key: `gemini-3.5-flash-lite`, `gemini-2.5-flash`, `gemini-3.1-flash-lite`.
 
 **Backend**
 
@@ -54,8 +66,8 @@ for f in path/to/starter-datasets/*/*.pdf; do
 done
 ```
 
-**Start with one document.** Extraction is one model call per chunk, and locally that is
-minutes per chunk — see Cost and the local-inference note below.
+**Start with one document.** Extraction is one model call per chunk, and the free tier is
+rate-limited — see Cost below.
 
 **Run the self-check** (no API key, no network, no test framework):
 
@@ -70,11 +82,12 @@ Each role is set as `provider:model`, where provider is `ollama`, `gemini` or
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `FACTLAYER_EXTRACT` | `ollama:llama3.1:8b` | model for fact extraction (the many calls) |
-| `FACTLAYER_JUDGE` | `gemini:gemini-3.8-flash` | model for relation judging (the calls that matter) |
+| `FACTLAYER_EXTRACT` | `gemini:gemini-3.5-flash-lite` | model for fact extraction (the many calls) |
+| `FACTLAYER_JUDGE` | `gemini:gemini-2.5-flash` | model for relation judging (the calls that matter) |
 | `GEMINI_API_KEY` | — | needed if either role is `gemini:` |
 | `ANTHROPIC_API_KEY` | — | needed if either role is `anthropic:` |
 | `FACTLAYER_JUDGE_RPM` | `14` | requests/min ceiling; keeps the Gemini free tier from 429ing |
+| `FACTLAYER_CHUNK_CHARS` | `4000` | chars per chunk; 8000 means ~30% fewer extraction calls |
 | `FACTLAYER_EXTRACT_CONCURRENCY` | `2` | parallel extraction calls |
 | `FACTLAYER_JUDGE_CONCURRENCY` | `2` | parallel judging calls |
 | `FACTLAYER_OLLAMA_CTX` | `8192` | Ollama context window; see the VRAM note below |
@@ -145,6 +158,18 @@ survive is stored with `grounded=0`, logged as an `ungrounded_quote` issue, show
 UI as a failure, and **never allowed to form a relation**. This is a cheap deterministic
 guard against the most common failure mode here: a fluent paraphrase presented as a
 quotation.
+
+The bar is **unambiguity, not length**. The first version required 15 characters, which
+seemed like a sensible floor until it rejected 73% of the facts extracted from the Q4
+earnings deck -- slide and table evidence is genuinely short (`YoY: 29.8%`, `7,054`) and
+was being thrown away for being brief rather than for being wrong. What makes a short
+quote weak is that it could point anywhere, so a quote under 15 characters must occur
+**exactly once** in its chunk to count; a longer one may repeat. That single change took
+grounded facts on the deck from 88 to 233 and left 92 genuine failures behind.
+
+Because grounding is pure string comparison against chunks that are already stored,
+`reground.py` re-runs the check over an existing database when the rule changes, rather
+than paying for extraction again.
 
 **Normalisation happens at extraction time, not at match time.** The model emits a
 canonical `attribute` (`revenue_from_operations`, `real_gdp_growth`) alongside the value

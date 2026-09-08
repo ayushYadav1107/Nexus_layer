@@ -83,11 +83,26 @@ def normalise(s):
     return re.sub(r"\s+", " ", s).strip().lower()
 
 
+MIN_QUOTE = 4          # below this a match is coincidence, not evidence
+UNAMBIGUOUS_AT = 15    # at or above this, one occurrence is enough
+
+
 def is_grounded(quote, chunk_text):
     """True when the quote appears verbatim (modulo whitespace) in the chunk.
 
     This is the cheap deterministic check that catches the most common LLM
     failure here: a paraphrase presented as a quotation.
+
+    Length alone is the wrong bar. Slide decks and financial tables are full of
+    short but perfectly good evidence -- "YoY: 29.8%", "7,054" -- and a 15-char
+    floor rejected 73% of otherwise valid facts on the Delhivery deck. What makes
+    a short quote weak is ambiguity, not brevity, so a short one has to occur
+    exactly once in the chunk to count; a long one may repeat.
     """
     q = normalise(quote)
-    return len(q) >= 15 and q in normalise(chunk_text)
+    if len(q) < MIN_QUOTE:
+        return False
+    t = normalise(chunk_text)
+    if q not in t:
+        return False
+    return len(q) >= UNAMBIGUOUS_AT or t.count(q) == 1

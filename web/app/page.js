@@ -3,10 +3,9 @@
 import { useCallback, useEffect, useState } from "react";
 
 const api = (p) => fetch(`/api${p}`).then((r) => r.json());
-
 const LIVE = ["pending", "parsing", "extracting", "linking"];
+const nf = new Intl.NumberFormat();
 
-// The four views the assignment asks to be demonstrated, plus a fact browser.
 const VIEWS = [
   { key: "corroborates", label: "Corroborated", hint: "Same claim, stated differently" },
   { key: "contradicts", label: "Contradictions", hint: "Incompatible under the same period and scope" },
@@ -128,37 +127,106 @@ function Fact({ f }) {
   );
 }
 
-function Doc({ d, onStop, stopping }) {
-  const live = LIVE.includes(d.status);
+/** The pipeline as a funnel of real counts. Doubles as an explanation of what the
+ *  system does, which is most of what the page needed to stop feeling empty. */
+function Funnel({ s }) {
+  const stages = [
+    { n: s.chunks, label: "chunks", note: "page-anchored" },
+    { n: s.facts, label: "facts", note: "extracted" },
+    { n: s.grounded, label: "grounded", note: "quote verified" },
+    { n: s.linked, label: "relations", note: "cross-referenced" },
+  ];
+  return (
+    <div className="funnel">
+      {stages.map((st, i) => (
+        <div className="stage" key={st.label}>
+          <b>{nf.format(st.n ?? 0)}</b>
+          <span>{st.label}</span>
+          <em>{st.note}</em>
+          {i < stages.length - 1 && <i className="arrow" aria-hidden="true" />}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** Status, so both segments carry a text label -- identity is never colour alone. */
+function GroundingBar({ grounded, ungrounded }) {
+  const total = grounded + ungrounded;
+  if (!total) return null;
+  const pct = Math.round((grounded / total) * 100);
+  return (
+    <div className="panel">
+      <div className="spread">
+        <h3>Evidence check</h3>
+        <span className="meta">{pct}% of extracted facts verified</span>
+      </div>
+      <div className="ratio">
+        <i className="ok" style={{ flex: grounded }} />
+        <i className="bad" style={{ flex: ungrounded }} />
+      </div>
+      <div className="legend">
+        <span><i className="sw ok" />{nf.format(grounded)} quote found verbatim</span>
+        <span><i className="sw bad" />{nf.format(ungrounded)} unverified — quarantined</span>
+      </div>
+    </div>
+  );
+}
+
+/** Magnitude across categories, so one hue -- not a categorical palette. */
+function AttributeBars({ attributes }) {
+  const top = (attributes || []).slice(0, 8);
+  if (!top.length) return null;
+  const max = Math.max(...top.map((a) => a.n));
+  return (
+    <div className="panel">
+      <div className="spread">
+        <h3>Most common fact types</h3>
+        <span className="meta">{attributes.length} distinct, none predeclared</span>
+      </div>
+      <ul className="bars">
+        {top.map((a) => (
+          <li key={a.attribute}>
+            <span className="blabel" title={a.attribute}>{a.attribute}</span>
+            <span className="btrack"><i style={{ width: `${(a.n / max) * 100}%` }} /></span>
+            <span className="bval">{a.n}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function DocCard({ d, live, selected, onSelect, onStop, stopping }) {
   const pct = d.total > 0 ? Math.round((d.done / d.total) * 100) : 0;
   return (
-    <li>
+    <div className={`doccard${selected ? " on" : ""}`} onClick={() => onSelect(d.id)}
+         role="button" tabIndex={0}
+         onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && onSelect(d.id)}>
       <div className="spread">
-        <span className="name">{d.filename}</span>
-        <span className="row" style={{ gap: 8 }}>
-          <span className="pill" data-s={d.status} data-live={live ? "1" : "0"}>{d.status}</span>
-          {live && (
-            <button className="stop" disabled={stopping} onClick={() => onStop(d.id)}>
-              {stopping ? "stopping…" : "Stop"}
-            </button>
-          )}
-        </span>
+        <span className="name" title={d.filename}>{d.filename}</span>
+        <span className="pill" data-s={d.status} data-live={live ? "1" : "0"}>{d.status}</span>
       </div>
-      <div className="meta">
-        {d.n_pages ? `${d.n_pages} pages` : "reading…"}
-        {d.n_facts ? <> <span className="dot">·</span> {d.n_facts} facts</> : null}
-        {d.n_issues ? <> <span className="dot">·</span> {d.n_issues} issues</> : null}
-        {live && d.total > 0 && (
-          <> <span className="dot">·</span> {d.status} {d.done}/{d.total} ({pct}%)</>
-        )}
-        {d.error ? <> <span className="dot">·</span> {d.error}</> : null}
+      <div className="dstats">
+        <span><b>{d.n_pages ?? "—"}</b> pages</span>
+        <span><b>{nf.format(d.n_chunks ?? 0)}</b> chunks</span>
+        <span><b>{nf.format(d.n_grounded ?? 0)}</b> facts</span>
+        <span><b>{nf.format(d.n_issues ?? 0)}</b> issues</span>
       </div>
       {live && (
-        <div className={`bar${d.total > 0 ? "" : " indet"}`}>
-          <i style={{ width: `${pct}%` }} />
-        </div>
+        <>
+          <div className={`bar${d.total > 0 ? "" : " indet"}`}><i style={{ width: `${pct}%` }} /></div>
+          <div className="spread" style={{ marginTop: 8 }}>
+            <span className="meta">{d.status} {d.done}/{d.total} ({pct}%)</span>
+            <button className="stop" disabled={stopping}
+                    onClick={(e) => { e.stopPropagation(); onStop(d.id); }}>
+              {stopping ? "stopping…" : "Stop"}
+            </button>
+          </div>
+        </>
       )}
-    </li>
+      {d.error && !live && <p className="meta derr">{d.error}</p>}
+    </div>
   );
 }
 
@@ -167,10 +235,12 @@ export default function Home() {
   const [stats, setStats] = useState(null);
   const [docs, setDocs] = useState([]);
   const [items, setItems] = useState([]);
+  const [docId, setDocId] = useState(null);          // null = every document
   const [q, setQ] = useState("");
   const [busy, setBusy] = useState(false);
   const [stopping, setStopping] = useState(null);
   const [err, setErr] = useState("");
+  const [notice, setNotice] = useState("");
   const [tick, setTick] = useState(0);
 
   const refresh = useCallback(async () => {
@@ -179,16 +249,13 @@ export default function Home() {
       setStats(s);
       setDocs(d);
       setErr("");
-      return d;
     } catch {
       setErr("Backend unreachable — is uvicorn running on :8000?");
-      return [];
     }
   }, []);
 
   useEffect(() => { refresh(); }, [refresh]);
 
-  // Poll fast while work is in flight, slowly when idle.
   useEffect(() => {
     const anyLive = docs.some((d) => LIVE.includes(d.status));
     const id = setInterval(() => {
@@ -199,29 +266,40 @@ export default function Home() {
   }, [docs, refresh]);
 
   useEffect(() => {
+    const doc = docId ? `&doc_id=${docId}` : "";
     const path =
-      view === "issues" ? "/issues"
-      : view === "facts" ? `/facts?limit=200&q=${encodeURIComponent(q)}`
-      : `/relations?kind=${view}`;
+      view === "issues" ? `/issues?limit=200${doc}`
+      : view === "facts" ? `/facts?limit=200&q=${encodeURIComponent(q)}${doc}`
+      : `/relations?kind=${view}${doc}`;
     api(path).then(setItems).catch(() => setItems([]));
-  }, [view, q, tick, stats?.facts, stats?.issues]);
+  }, [view, q, docId, tick, stats?.facts, stats?.issues]);
 
   async function upload(e) {
     const files = [...e.target.files];
     e.target.value = "";
+    if (!files.length) return;
     setBusy(true);
     setErr("");
+    setNotice("");
+    const notes = [];
     try {
       for (const file of files) {
         const body = new FormData();
         body.append("file", file);
         const res = await fetch("/api/documents", { method: "POST", body });
-        if (!res.ok) throw new Error(`${file.name}: ${res.status} ${await res.text()}`);
+        const out = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(`${file.name}: ${out.detail || res.status}`);
+        // Say what the server did. A duplicate returns 200 and changes nothing,
+        // which is indistinguishable from a dead button unless we report it.
+        notes.push(out.status === "duplicate"
+          ? `${file.name}: ${out.detail}`
+          : `${file.name}: processing started`);
       }
       await refresh();
     } catch (e2) {
       setErr(String(e2.message || e2));
     } finally {
+      setNotice(notes.join(" · "));
       setBusy(false);
     }
   }
@@ -247,22 +325,29 @@ export default function Home() {
     issues: stats?.issues || 0,
     facts: stats?.grounded || 0,
   };
-  const models = stats?.models;
+  const perDoc = stats?.per_document || [];
+  const chunks = perDoc.reduce((n, d) => n + (d.n_chunks || 0), 0);
+  const ungrounded = perDoc.reduce((n, d) => n + (d.n_ungrounded || 0), 0);
+  const linked = counts.corroborates + counts.contradicts + counts.reconciled;
+  const selectedName = docId && perDoc.find((d) => d.id === docId)?.filename;
 
   return (
     <main className="wrap">
-      <h1>Fact Knowledge Layer</h1>
-      <p className="sub">
-        Facts extracted from PDFs, each pinned to a verbatim quote on a specific page, then
-        cross-referenced against every fact already in the layer.
-      </p>
+      <header className="hero">
+        <h1>Nexus Layer</h1>
+        <p className="sub">
+          Facts extracted from PDFs, each pinned to a verbatim quote on a specific page,
+          then cross-referenced against every fact already in the layer — corroborating,
+          contradicting, or reconciled by context.
+        </p>
+      </header>
 
       <div className="card">
         <div className="spread">
           <div className="stats">
             <div className="stat"><b>{stats?.documents ?? "—"}</b><span>documents</span></div>
-            <div className="stat"><b>{stats?.grounded ?? "—"}</b><span>grounded facts</span></div>
-            <div className="stat"><b>{stats?.cross_doc_relations ?? "—"}</b><span>cross-doc links</span></div>
+            <div className="stat"><b>{nf.format(stats?.grounded ?? 0)}</b><span>grounded facts</span></div>
+            <div className="stat"><b>{nf.format(stats?.cross_doc_relations ?? 0)}</b><span>cross-doc links</span></div>
             <div className="stat"><b>{stats?.attributes?.length ?? "—"}</b><span>fact types</span></div>
           </div>
           <label className="filebtn">
@@ -271,25 +356,58 @@ export default function Home() {
           </label>
         </div>
 
-        {models && (
-          <p className="meta" style={{ marginTop: 12 }}>
-            extraction <span className="attr">{models.extract}</span>
+        {stats?.models && (
+          <p className="meta models">
+            extraction <span className="attr">{stats.models.extract}</span>
             <span className="dot">·</span>
-            judging <span className="attr">{models.judge}</span>
+            judging <span className="attr">{stats.models.judge}</span>
           </p>
         )}
         {err && <p className="err">{err}</p>}
+        {notice && <p className="notice">{notice}</p>}
 
-        {docs.length > 0 && (
-          <ul className="docs">
-            {docs.map((d) => (
-              <Doc key={d.id} d={d} onStop={stop} stopping={stopping === d.id} />
-            ))}
-          </ul>
+        {stats?.facts > 0 && (
+          <Funnel s={{ chunks, facts: stats.facts, grounded: stats.grounded, linked }} />
         )}
       </div>
 
-      <div className="row tabs" style={{ marginBottom: 18 }}>
+      {perDoc.length > 0 && (
+        <>
+          <div className="secthead">
+            <h2>Documents</h2>
+            <span className="meta">
+              {docId ? `filtered to ${selectedName}` : "click one to filter everything below"}
+            </span>
+            {docId && <button className="link" onClick={() => setDocId(null)}>show all</button>}
+          </div>
+          <div className="docgrid">
+            {perDoc.map((d) => {
+              const row = docs.find((x) => x.id === d.id) || {};
+              const merged = { ...d, done: row.done, total: row.total, error: row.error };
+              return (
+                <DocCard key={d.id} d={merged} live={LIVE.includes(d.status)}
+                         selected={docId === d.id} stopping={stopping === d.id}
+                         onSelect={(id) => setDocId(docId === id ? null : id)}
+                         onStop={stop} />
+              );
+            })}
+          </div>
+        </>
+      )}
+
+      {stats?.facts > 0 && (
+        <div className="panels">
+          <GroundingBar grounded={stats.grounded} ungrounded={ungrounded} />
+          <AttributeBars attributes={stats.attributes} />
+        </div>
+      )}
+
+      <div className="secthead">
+        <h2>Cross-references</h2>
+        {docId && <span className="meta">within {selectedName}</span>}
+      </div>
+
+      <div className="row tabs">
         {VIEWS.map((v) => (
           <button key={v.key} aria-pressed={view === v.key} title={v.hint}
                   onClick={() => setView(v.key)}>
@@ -303,13 +421,16 @@ export default function Home() {
       </div>
 
       {items.length === 0 && (
-        <p className="empty">
-          {docs.length === 0
-            ? "Upload a PDF to begin."
-            : docs.some((d) => LIVE.includes(d.status))
-            ? "Still processing — results appear here as they are found."
-            : "Nothing found in this view yet."}
-        </p>
+        <div className="empty">
+          <p>
+            {docs.length === 0
+              ? "Upload a PDF to begin."
+              : docs.some((d) => LIVE.includes(d.status))
+              ? "Still processing — results appear here as they are found."
+              : `No ${VIEWS.find((v) => v.key === view)?.label.toLowerCase()} yet${docId ? " for this document" : ""}.`}
+          </p>
+          {docId && <button className="link" onClick={() => setDocId(null)}>clear the document filter</button>}
+        </div>
       )}
 
       {view === "issues" && items.map((i, n) => (

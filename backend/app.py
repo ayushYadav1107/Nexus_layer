@@ -80,10 +80,14 @@ async def process(doc_id, filename, pdf_bytes):
         store.set_progress(doc_id, 0, len(chunks))
 
         new_fact_ids = []
+        call_errors = 0
 
         def keep(result):
+            nonlocal call_errors
             chunk_id, chunk, facts, issues = result
             for iss in issues:
+                if iss["kind"] == "llm_error":
+                    call_errors += 1
                 store.add_issue(doc_id, iss.get("page", chunk["page"]), iss["kind"],
                                 iss["detail"], iss.get("payload"))
             for f in facts:
@@ -98,6 +102,17 @@ async def process(doc_id, filename, pdf_bytes):
         await _drain([asyncio.create_task(one_chunk(cid, c))
                       for cid, c in zip(chunk_ids, chunks)],
                      keep, doc_id, len(chunks))
+
+        # A run where every call failed is not a finished document. Marking it
+        # "done" hid a total API failure behind a green badge and, because uploads
+        # dedupe on content, made it impossible to retry: re-uploading answered
+        # "duplicate" and the button appeared to do nothing.
+        if not new_fact_ids and call_errors:
+            store.set_doc_status(
+                doc_id, "failed",
+                error=f"all {call_errors} extraction calls failed - see Failures")
+            store.set_progress(doc_id, 0, 0)
+            return
 
         store.set_doc_status(doc_id, "linking")
         store.set_progress(doc_id, 0, len(new_fact_ids))
@@ -156,9 +171,13 @@ async def upload(file: UploadFile):
         with store.db() as con:
             prior = con.execute("SELECT status FROM documents WHERE id=?",
                                 (doc_id,)).fetchone()["status"]
-        if prior == "done":
+            n_facts = con.execute("SELECT COUNT(*) c FROM facts WHERE doc_id=?",
+                                  (doc_id,)).fetchone()["c"]
+        # "done" only blocks a retry if the run actually produced something. A run
+        # that finished with nothing is worth repeating, whatever it was labelled.
+        if prior == "done" and n_facts:
             return {"id": doc_id, "status": "duplicate",
-                    "detail": "identical file already ingested"}
+                    "detail": f"already ingested - {n_facts} facts from this file"}
         # Uploads are deduplicated by content hash, so re-uploading is the natural
         # way to retry a run that failed or was stopped. Clear what it left behind.
         store.reset_document(doc_id)
@@ -255,8 +274,10 @@ def fact_detail(fact_id: int):
 
 @app.get("/relations")
 def relations(kind: str | None = None, cross_doc: int | None = None,
-              min_confidence: float = 0.0, limit: int = 200):
-    """The main cross-reference view. `kind` filters to one of the demo cases."""
+              doc_id: int | None = None, min_confidence: float = 0.0,
+              limit: int = 200):
+    """The main cross-reference view. `kind` filters to one of the demo cases;
+    `doc_id` narrows to relations touching that document on either side."""
     where = ["r.kind != 'unrelated'", "COALESCE(r.confidence,1) >= ?"]
     args = [min_confidence]
     if kind:
@@ -265,6 +286,9 @@ def relations(kind: str | None = None, cross_doc: int | None = None,
     if cross_doc is not None:
         where.append("r.cross_doc = ?")
         args.append(cross_doc)
+    if doc_id:
+        where.append("(a.doc_id = ? OR b.doc_id = ?)")
+        args.extend([doc_id, doc_id])
     args.append(min(limit, 1000))
     with store.db() as con:
         rows = con.execute(f"""
@@ -316,7 +340,15 @@ def stats():
         # accumulate as documents introduce new kinds of fact.
         attrs = [dict(r) for r in con.execute(
             "SELECT attribute, COUNT(*) n FROM facts GROUP BY attribute ORDER BY n DESC LIMIT 40")]
+        per_doc = [dict(r) for r in con.execute("""
+            SELECT d.id, d.filename, d.n_pages, d.status,
+              (SELECT COUNT(*) FROM chunks WHERE doc_id=d.id) AS n_chunks,
+              (SELECT COUNT(*) FROM facts  WHERE doc_id=d.id AND grounded=1) AS n_grounded,
+              (SELECT COUNT(*) FROM facts  WHERE doc_id=d.id AND grounded=0) AS n_ungrounded,
+              (SELECT COUNT(*) FROM issues WHERE doc_id=d.id) AS n_issues
+            FROM documents d ORDER BY d.id""")]
         return {
+            "per_document": per_doc,
             "documents": one("SELECT COUNT(*) FROM documents"),
             "facts": one("SELECT COUNT(*) FROM facts"),
             "grounded": one("SELECT COUNT(*) FROM facts WHERE grounded=1"),
