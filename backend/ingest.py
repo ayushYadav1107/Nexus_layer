@@ -5,12 +5,21 @@ buys exact page attribution for every quote, which is the whole point of the
 grounding layer. Windows within a long page overlap so a sentence split across
 the window boundary still appears whole in one of them.
 """
+import os
 import re
 
 import pymupdf
 
-WINDOW = 4000      # chars per chunk; ~1k tokens, comfortably inside one LLM call
-OVERLAP = 400
+import env  # noqa: F401  loads .env before the reads below
+
+# Chars per chunk. This is the single biggest lever on how long a run takes,
+# because extraction is one model call per chunk: at 4000 most pages of a dense
+# report split in two, at 8000 most fit whole. Bigger chunks mean fewer calls and
+# no split context, at the cost of asking the model to read more at once -- worth
+# it on any model with a large context window. Page boundaries are still never
+# crossed, so page attribution is unaffected either way.
+WINDOW = int(os.environ.get("FACTLAYER_CHUNK_CHARS", "4000"))
+OVERLAP = min(400, WINDOW // 10)
 MIN_TEXT = 80      # below this a page is treated as having no extractable text
 
 

@@ -30,6 +30,8 @@ import urllib.error
 import urllib.request
 from contextlib import asynccontextmanager
 
+import env  # noqa: F401  loads .env before the reads below
+
 EXTRACT_SPEC = os.environ.get("FACTLAYER_EXTRACT", "ollama:llama3.1:8b")
 JUDGE_SPEC = os.environ.get("FACTLAYER_JUDGE", "gemini:gemini-3.8-flash")
 
@@ -163,7 +165,8 @@ def _gemini_schema(s):
 async def _gemini(model, system, user, schema, max_tokens):
     key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not key:
-        raise LLMError("GEMINI_API_KEY is not set")
+        raise LLMError("GEMINI_API_KEY is empty or unset -- put it in backend/.env "
+                       "(copy .env.example), or export it in the shell")
     data = await asyncio.to_thread(
         _post_sync, f"{GEMINI_ENDPOINT}/{model}:generateContent",
         {"systemInstruction": {"parts": [{"text": system}]},

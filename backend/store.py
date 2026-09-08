@@ -11,6 +11,8 @@ import sqlite3
 import time
 from contextlib import contextmanager
 
+import env  # noqa: F401  loads .env before the reads below
+
 DB_PATH = os.environ.get("FACTLAYER_DB", os.path.join(os.path.dirname(__file__), "factlayer.db"))
 
 SCHEMA = """
@@ -19,9 +21,11 @@ CREATE TABLE IF NOT EXISTS documents (
   filename    TEXT NOT NULL,
   sha256      TEXT NOT NULL UNIQUE,
   n_pages     INTEGER,
-  status      TEXT NOT NULL DEFAULT 'pending',   -- pending|parsing|extracting|linking|done|failed
+  status      TEXT NOT NULL DEFAULT 'pending',   -- pending|parsing|extracting|linking|done|failed|cancelled
   error       TEXT,
-  created_at  REAL NOT NULL
+  created_at  REAL NOT NULL,
+  done        INTEGER NOT NULL DEFAULT 0,        -- units finished in the current phase
+  total       INTEGER NOT NULL DEFAULT 0         -- units in the current phase
 );
 
 CREATE TABLE IF NOT EXISTS chunks (
@@ -123,6 +127,13 @@ def init():
     with db() as con:
         con.execute("PRAGMA journal_mode=WAL")
         con.executescript(SCHEMA)
+        # CREATE TABLE IF NOT EXISTS will not add columns to a database made by an
+        # earlier version, so bring those forward explicitly.
+        have = {r["name"] for r in con.execute("PRAGMA table_info(documents)")}
+        for col, decl in (("done", "INTEGER NOT NULL DEFAULT 0"),
+                          ("total", "INTEGER NOT NULL DEFAULT 0")):
+            if col not in have:
+                con.execute(f"ALTER TABLE documents ADD COLUMN {col} {decl}")
 
 
 def add_document(filename, sha256):
@@ -144,6 +155,29 @@ def set_doc_status(doc_id, status, error=None, n_pages=None):
             "UPDATE documents SET status=?, error=COALESCE(?,error), n_pages=COALESCE(?,n_pages) WHERE id=?",
             (status, error, n_pages, doc_id),
         )
+
+
+def reset_document(doc_id):
+    """Clear a document's derived data so it can be ingested again.
+
+    Chunks cascade to facts and facts cascade to relations, so this leaves the
+    document row and drops everything downstream of it. Needed because uploads are
+    deduplicated by content hash: without it, a run that failed or was cancelled
+    could never be retried without deleting the whole database.
+    """
+    with db() as con:
+        con.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
+        con.execute("DELETE FROM issues WHERE doc_id=?", (doc_id,))
+        con.execute("UPDATE documents SET status='pending', error=NULL, done=0, total=0 "
+                    "WHERE id=?", (doc_id,))
+
+
+def set_progress(doc_id, done, total):
+    """Progress within the current phase. Written as work completes, not at the
+    end -- a run that shows nothing for 45 minutes is indistinguishable from a
+    run that is silently failing, which is exactly how this went wrong once."""
+    with db() as con:
+        con.execute("UPDATE documents SET done=?, total=? WHERE id=?", (done, total, doc_id))
 
 
 def add_chunks(doc_id, chunks):

@@ -210,6 +210,116 @@ def test_delete_cascades_and_fts_stays_in_sync():
     assert hits == 0, "FTS index still holds a deleted fact"
 
 
+def test_env_file_loads_but_never_overrides_the_shell():
+    import tempfile as _tf
+    from pathlib import Path
+
+    import env
+    d = Path(_tf.mkdtemp())
+    (d / ".env").write_text(
+        "# a comment\n"
+        "\n"
+        "FACTLAYER_TEST_PLAIN=hello\n"
+        "export FACTLAYER_TEST_EXPORTED=world\n"
+        'FACTLAYER_TEST_QUOTED="spaced value"\n'
+        "FACTLAYER_TEST_HASH=abc#def\n"          # '#' inside a value is not a comment
+        "FACTLAYER_TEST_ALREADY=from-file\n"
+        "not-a-pair\n",
+        encoding="utf-8")
+    os.environ["FACTLAYER_TEST_ALREADY"] = "from-shell"
+    try:
+        applied = env.load(d / ".env")
+        assert os.environ["FACTLAYER_TEST_PLAIN"] == "hello"
+        assert os.environ["FACTLAYER_TEST_EXPORTED"] == "world", "export prefix stripped"
+        assert os.environ["FACTLAYER_TEST_QUOTED"] == "spaced value", "quotes stripped once"
+        assert os.environ["FACTLAYER_TEST_HASH"] == "abc#def", "no inline-comment stripping"
+        # The rule that keeps the test suite and CI safe from a stray .env:
+        assert os.environ["FACTLAYER_TEST_ALREADY"] == "from-shell"
+        assert "FACTLAYER_TEST_ALREADY" not in applied
+        assert env.load(d / "nope.env") == [], "a missing file is not an error"
+    finally:
+        for k in [k for k in os.environ if k.startswith("FACTLAYER_TEST_")]:
+            del os.environ[k]
+
+
+def test_drain_reports_progress_as_work_lands():
+    # The bug this replaces: results were gathered for the whole document before
+    # anything was written, so a 237-chunk run showed 0 facts and 0 issues for its
+    # entire duration and a silent API failure looked exactly like healthy progress.
+    import asyncio
+
+    import app
+    store.init()
+    doc_id, _ = store.add_document("x.pdf", "hash-drain")
+    seen = []
+
+    async def unit(n):
+        await asyncio.sleep(0.01 * (5 - n))       # finish out of creation order
+        return n
+
+    async def go():
+        tasks = [asyncio.create_task(unit(i)) for i in range(5)]
+        return await app._drain(tasks, seen.append, doc_id, 5)
+
+    assert asyncio.run(go()) == 5
+    assert sorted(seen) == [0, 1, 2, 3, 4], "every unit must reach the writer"
+    with store.db() as con:
+        r = con.execute("SELECT done, total FROM documents WHERE id=?", (doc_id,)).fetchone()
+    assert (r["done"], r["total"]) == (5, 5), "progress must be persisted, not just counted"
+
+
+def test_drain_cancels_leftover_work_when_stopped():
+    # Stopping a run from the UI has to stop the outstanding calls too;
+    # asyncio.as_completed does not cancel them on its own.
+    import asyncio
+
+    import app
+    store.init()
+    doc_id, _ = store.add_document("y.pdf", "hash-cancel")
+    captured = []
+
+    async def go():
+        async def quick():
+            return "quick"
+
+        async def forever():
+            await asyncio.Event().wait()
+
+        tasks = [asyncio.create_task(quick()), asyncio.create_task(forever())]
+        captured.append(tasks[1])
+        drain = asyncio.create_task(app._drain(tasks, lambda _v: None, doc_id, 2))
+        await asyncio.sleep(0.05)
+        drain.cancel()
+        try:
+            await drain
+        except asyncio.CancelledError:
+            pass
+        await asyncio.sleep(0.05)
+
+    asyncio.run(go())
+    assert captured[0].cancelled(), "outstanding work must be cancelled, not left running"
+
+
+def test_cancelled_document_can_be_re_ingested():
+    # Uploads are deduplicated by content hash, so without reset_document a run
+    # that was stopped or failed could never be retried.
+    seed()
+    doc_id = 1
+    store.set_doc_status(doc_id, "cancelled", error="stopped from the UI")
+    store.reset_document(doc_id)
+    with store.db() as con:
+        d = con.execute("SELECT status, error, done, total FROM documents WHERE id=?",
+                        (doc_id,)).fetchone()
+        n = lambda t: con.execute(
+            f"SELECT COUNT(*) c FROM {t} WHERE doc_id=?", (doc_id,)).fetchone()["c"]
+        chunks, facts, issues = n("chunks"), n("facts"), n("issues")
+    assert d["status"] == "pending" and d["error"] is None
+    assert (d["done"], d["total"]) == (0, 0)
+    assert chunks == 0, "chunks cleared so a retry does not duplicate them"
+    assert facts == 0, "facts cascade from chunks"
+    assert issues == 0
+
+
 def test_api_routes_return_what_the_ui_needs():
     import app  # imported late: it pulls in the LLM modules
     ids = seed()

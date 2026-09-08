@@ -14,6 +14,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
+import env  # noqa: F401  loads .env before the reads below
+
 import extract
 import ingest
 import link
@@ -21,7 +23,7 @@ import llm
 import store
 
 MAX_UPLOAD = int(os.environ.get("FACTLAYER_MAX_UPLOAD_MB", "50")) * 1024 * 1024
-_running = set()
+_running = {}   # doc_id -> Task, so a run can be stopped from the UI
 
 
 @asynccontextmanager
@@ -36,11 +38,32 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 # ---------------------------------------------------------------- pipeline
 
+async def _drain(tasks, on_result, doc_id, total):
+    """Consume tasks as they finish, persisting each one immediately.
+
+    Results are written per unit rather than after an asyncio.gather over the whole
+    document. Gathering first meant a 237-chunk run showed zero facts and zero
+    issues for its entire duration, so a silent API failure looked exactly like
+    healthy progress -- and cancelling left nothing behind at all.
+    """
+    done = 0
+    try:
+        for fut in asyncio.as_completed(tasks):
+            on_result(await fut)
+            done += 1
+            store.set_progress(doc_id, done, total)
+    finally:
+        # as_completed does not cancel the rest when the caller goes away.
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+    return done
+
+
 async def process(doc_id, filename, pdf_bytes):
     try:
         store.set_doc_status(doc_id, "parsing")
         chunks, empty_pages, n_pages = ingest.parse(pdf_bytes)
-        store.set_doc_status(doc_id, "extracting", n_pages=n_pages)
         for p in empty_pages:
             store.add_issue(doc_id, p, "no_text",
                             "No extractable text on this page (scanned image, or "
@@ -50,11 +73,13 @@ async def process(doc_id, filename, pdf_bytes):
             return
 
         chunk_ids = store.add_chunks(doc_id, chunks)
-
-        results = await asyncio.gather(*(extract.extract_chunk(filename, c) for c in chunks))
+        store.set_doc_status(doc_id, "extracting", n_pages=n_pages)
+        store.set_progress(doc_id, 0, len(chunks))
 
         new_fact_ids = []
-        for chunk_id, chunk, (facts, issues) in zip(chunk_ids, chunks, results):
+
+        def keep(result):
+            chunk_id, chunk, facts, issues = result
             for iss in issues:
                 store.add_issue(doc_id, iss.get("page", chunk["page"]), iss["kind"],
                                 iss["detail"], iss.get("payload"))
@@ -63,25 +88,49 @@ async def process(doc_id, filename, pdf_bytes):
                 if f["grounded"]:
                     new_fact_ids.append(fid)
 
+        async def one_chunk(chunk_id, chunk):
+            facts, issues = await extract.extract_chunk(filename, chunk)
+            return chunk_id, chunk, facts, issues
+
+        await _drain([asyncio.create_task(one_chunk(cid, c))
+                      for cid, c in zip(chunk_ids, chunks)],
+                     keep, doc_id, len(chunks))
+
         store.set_doc_status(doc_id, "linking")
-        # Judged in waves of 32 rather than all at once: facts stored by one wave are
+        store.set_progress(doc_id, 0, len(new_fact_ids))
+
+        def record(result):
+            verdicts, issues = result
+            for iss in issues:
+                store.add_issue(doc_id, iss.get("page"), iss["kind"], iss["detail"])
+            for v in verdicts:
+                store.add_relation(v["a_id"], v["b_id"], v["kind"], v["confidence"],
+                                   v["reasoning"], v["resolution"], v["cross_doc"])
+
+        # Judged in waves rather than all at once: facts stored by one wave are
         # candidates for the next, so a document's own internal contradictions get
         # found without a second pass. Concurrency and rate limiting live in llm.py,
         # which is the only place that knows what each role is talking to.
-        for batch_start in range(0, len(new_fact_ids), 32):
-            batch = new_fact_ids[batch_start:batch_start + 32]
-            for verdicts, issues in await asyncio.gather(
-                    *(link.judge(f) for f in batch)):
-                for iss in issues:
-                    store.add_issue(doc_id, iss.get("page"), iss["kind"], iss["detail"])
-                for v in verdicts:
-                    store.add_relation(v["a_id"], v["b_id"], v["kind"], v["confidence"],
-                                       v["reasoning"], v["resolution"], v["cross_doc"])
+        judged = 0
+        for start in range(0, len(new_fact_ids), 32):
+            wave = new_fact_ids[start:start + 32]
+            await _drain([asyncio.create_task(link.judge(f)) for f in wave],
+                         record, doc_id, len(new_fact_ids))
+            judged += len(wave)
+            store.set_progress(doc_id, judged, len(new_fact_ids))
 
         store.set_doc_status(doc_id, "done")
+        store.set_progress(doc_id, 0, 0)
+    except asyncio.CancelledError:
+        # Stopped from the UI. Whatever was already extracted stays -- it is real,
+        # grounded and useful; only the unfinished remainder is dropped.
+        store.set_doc_status(doc_id, "cancelled", error="stopped from the UI")
+        store.set_progress(doc_id, 0, 0)
+        raise
     except Exception as e:  # never leave a document stuck mid-status
         store.set_doc_status(doc_id, "failed", error=f"{type(e).__name__}: {e}")
         store.add_issue(doc_id, None, "pipeline_error", f"{type(e).__name__}: {e}")
+        store.set_progress(doc_id, 0, 0)
 
 
 # ---------------------------------------------------------------- routes
@@ -98,14 +147,34 @@ async def upload(file: UploadFile):
 
     doc_id, is_new = store.add_document(file.filename, hashlib.sha256(data).hexdigest())
     if not is_new:
-        return {"id": doc_id, "status": "duplicate",
-                "detail": "identical file already ingested"}
-    # Hold a reference: asyncio keeps only a weak one, and a garbage-collected
-    # task would abandon the document mid-pipeline.
+        if doc_id in _running:
+            return {"id": doc_id, "status": "duplicate",
+                    "detail": "this document is already being processed"}
+        with store.db() as con:
+            prior = con.execute("SELECT status FROM documents WHERE id=?",
+                                (doc_id,)).fetchone()["status"]
+        if prior == "done":
+            return {"id": doc_id, "status": "duplicate",
+                    "detail": "identical file already ingested"}
+        # Uploads are deduplicated by content hash, so re-uploading is the natural
+        # way to retry a run that failed or was stopped. Clear what it left behind.
+        store.reset_document(doc_id)
+    # Keyed by document, both to hold a reference (asyncio keeps only a weak one,
+    # and a collected task would abandon the run) and so /cancel can find it.
     task = asyncio.create_task(process(doc_id, file.filename, data))
-    _running.add(task)
-    task.add_done_callback(_running.discard)
+    _running[doc_id] = task
+    task.add_done_callback(lambda _t, d=doc_id: _running.pop(d, None))
     return {"id": doc_id, "status": "pending"}
+
+
+@app.post("/documents/{doc_id}/cancel")
+async def cancel(doc_id: int):
+    """Stop an in-flight run. Facts already extracted are kept."""
+    task = _running.get(doc_id)
+    if task is None or task.done():
+        raise HTTPException(409, "document is not currently being processed")
+    task.cancel()
+    return {"id": doc_id, "status": "cancelling"}
 
 
 @app.get("/documents")

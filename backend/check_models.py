@@ -10,6 +10,8 @@ identical llm_error issues.
 import asyncio
 import sys
 
+import env  # noqa: F401  loads .env before the reads below
+
 import llm
 
 SCHEMA = {
@@ -47,11 +49,12 @@ async def main():
     if all(results):
         print("Both roles are live. Safe to ingest.\n")
         return 0
+    print(f"Settings come from {env.PATH} (shell variables override it).")
     print("Fix the failing role before ingesting. Common causes:")
     print("  ollama  - server not running (`ollama serve`), or model not pulled")
     print("            (`ollama pull llama3.1:8b`)")
-    print("  gemini  - GEMINI_API_KEY unset, or the model name is not one your key")
-    print("            can reach; list them with:")
+    print("  gemini  - GEMINI_API_KEY blank in .env, or the model name is not one")
+    print("            your key can reach; list what it can reach with:")
     print("            curl 'https://generativelanguage.googleapis.com/v1beta/models'"
           " -H \"x-goog-api-key: $GEMINI_API_KEY\"\n")
     return 1
