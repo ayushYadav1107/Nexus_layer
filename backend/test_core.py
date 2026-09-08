@@ -20,7 +20,7 @@ import store  # noqa: E402  (must see FACTLAYER_DB)
 import link   # noqa: E402
 
 store.DB_PATH = DB_FILE
-
+# added some functions
 
 def make_pdf(pages):
     doc = pymupdf.open()
