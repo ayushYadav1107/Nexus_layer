@@ -29,6 +29,9 @@ _running = {}   # doc_id -> Task, so a run can be stopped from the UI
 @asynccontextmanager
 async def lifespan(_app):
     store.init()
+    orphaned = store.mark_orphans()
+    if orphaned:
+        print(f"reconciled {orphaned} document(s) left mid-run by a previous process")
     yield
 
 

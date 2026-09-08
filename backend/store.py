@@ -157,6 +157,26 @@ def set_doc_status(doc_id, status, error=None, n_pages=None):
         )
 
 
+LIVE_STATUSES = ("pending", "parsing", "extracting", "linking")
+
+
+def mark_orphans():
+    """Fail documents left mid-run by a process that is no longer alive.
+
+    A run only exists inside the process that started it, so anything still in a
+    live status at startup was orphaned by a crash, a restart or a Ctrl+C. Left
+    alone the UI shows it processing forever, and Stop answers 409 because there
+    is no task to cancel. Returns how many were reconciled.
+    """
+    marks = ",".join("?" * len(LIVE_STATUSES))
+    with db() as con:
+        n = con.execute(
+            f"UPDATE documents SET status='interrupted', done=0, total=0, "
+            f"error='interrupted -- the server restarted mid-run; re-upload to resume' "
+            f"WHERE status IN ({marks})", LIVE_STATUSES).rowcount
+    return n
+
+
 def reset_document(doc_id):
     """Clear a document's derived data so it can be ingested again.
 

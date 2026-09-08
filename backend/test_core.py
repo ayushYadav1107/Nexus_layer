@@ -300,6 +300,27 @@ def test_drain_cancels_leftover_work_when_stopped():
     assert captured[0].cancelled(), "outstanding work must be cancelled, not left running"
 
 
+def test_startup_reconciles_runs_orphaned_by_a_restart():
+    # A run lives only inside the process that started it. After a crash or a
+    # restart the row still says "extracting", so the UI shows a progress bar
+    # forever and Stop answers 409 because there is no task to cancel.
+    seed()
+    with store.db() as con:
+        con.execute("UPDATE documents SET status='extracting', total=214, done=7 WHERE id=1")
+        con.execute("UPDATE documents SET status='done' WHERE id=2")
+
+    assert store.mark_orphans() == 1, "only the live document is reconciled"
+
+    with store.db() as con:
+        a = con.execute("SELECT status, error, done, total FROM documents WHERE id=1").fetchone()
+        b = con.execute("SELECT status FROM documents WHERE id=2").fetchone()
+    assert a["status"] == "interrupted"
+    assert (a["done"], a["total"]) == (0, 0), "stale progress must not keep a bar moving"
+    assert "re-upload" in a["error"], "the row should say how to recover"
+    assert b["status"] == "done", "finished documents are left alone"
+    assert store.mark_orphans() == 0, "running it again is a no-op"
+
+
 def test_cancelled_document_can_be_re_ingested():
     # Uploads are deduplicated by content hash, so without reset_document a run
     # that was stopped or failed could never be retried.

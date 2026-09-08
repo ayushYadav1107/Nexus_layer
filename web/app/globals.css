@@ -227,7 +227,8 @@ input[type="search"]:focus {
 }
 .pill[data-s="done"] { background: var(--green-bg); color: var(--green); }
 .pill[data-s="failed"] { background: var(--rose-bg); color: var(--rose); }
-.pill[data-s="cancelled"] { background: var(--amber-bg); color: var(--amber); }
+.pill[data-s="cancelled"],
+.pill[data-s="interrupted"] { background: var(--amber-bg); color: var(--amber); }
 .pill[data-live="1"] { background: var(--blue-bg); color: var(--blue); animation: breathe 1.8s ease-in-out infinite; }
 
 @keyframes breathe { 0%, 100% { opacity: 1; } 50% { opacity: .5; } }
