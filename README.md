@@ -28,9 +28,21 @@ npm install
 npm run dev
 ```
 
-Open <http://localhost:3000>, upload the PDFs from `starter-datasets/`, and watch the
-document list until it reads `done`. Interactive API docs are at
-<http://localhost:8000/docs>.
+Open <http://localhost:3000>, upload one or more PDFs, and watch the document list until
+it reads `done`. Interactive API docs are at <http://localhost:8000/docs>.
+
+The six starter PDFs are not committed to this repository — download them from the
+assignment's `starter-datasets/` folder and upload them through the UI, or from the
+command line:
+
+```bash
+for f in path/to/starter-datasets/*/*.pdf; do
+  curl -X POST http://localhost:8000/documents -F "file=@$f"
+done
+```
+
+**Start with one document.** Extraction is one model call per chunk, so a full six-document
+run is not cheap — see Cost below.
 
 **Run the self-check** (no API key, no network, no test framework):
 
@@ -135,7 +147,24 @@ confidence, reasoning, and — for `reconciled` — the specific dimension that 
 gap. The prompt forces the checking order that matters: *never* label a numeric
 disagreement a contradiction before checking period, scope, unit and publication vintage.
 
-### 4. Incremental by construction
+### 4. The interface, and verifying evidence
+
+The UI is a single page with five tabs — four of them are the required cases
+(`corroborates`, `contradicts`, `reconciled`, and a Failures tab backed by `/issues`),
+the fifth is a searchable list of every grounded fact.
+
+Each relation is a card showing both facts side by side: source document, page, entity,
+canonical attribute, period, scope, the value as written, and the verbatim quote — then
+the judge's reasoning, and for a reconciled pair the named dimension that explains the
+gap.
+
+Every quote has a **"verify on source page"** control. It fetches `/facts/{id}` and
+renders the full page text the quote came from, with the quote highlighted in place. That
+matters more than it sounds: a grounding claim you cannot check is just another assertion.
+The match is whitespace-tolerant, because the stored quote is normalised and the page is
+not, so it still lands when the original wraps across lines.
+
+### 5. Incremental by construction
 
 Adding a document extracts only its own chunks and judges only its own new facts, against
 everything already stored. `relations` is `UNIQUE(a_id, b_id)` with the pair normalised to
@@ -168,6 +197,21 @@ outputs and prompt caching on the stable system prompts.
 ---
 
 ## Limitations and Next Steps
+
+**What has actually been run, and what has not**
+
+Being precise about this, because it changes how much weight the rest of this section
+carries. Verified end to end: PDF parsing on all six starter documents (511 pages, 2.1 s),
+upload and duplicate rejection, the full pipeline reaching `done`, the grounding check,
+candidate blocking, idempotent relinking, all API routes, and every UI tab including the
+source-page verification, exercised against real pages from the Delhivery documents.
+`python test_core.py` covers the non-LLM logic: 8 checks, all passing.
+
+**Not run: a single live model call.** The environment this was built in had no Anthropic
+credentials, so extraction and judging quality — the actual substance of the system — is
+untested. The prompts are careful and the schemas are enforced, but no fact has been
+extracted and no relation judged. Treat the four cases as demonstrated by the plumbing,
+not yet by output, until you run it with a key.
 
 **What does not work yet**
 
@@ -220,9 +264,27 @@ JSON errors, so the system's blind spots are a visible feature rather than a sil
 - **API** — `POST /documents` (upload), `GET /documents`, `GET /facts?q=&doc_id=&grounded=`,
   `GET /facts/{id}` (fact + surrounding chunk + its relations), `GET /relations?kind=&cross_doc=`,
   `GET /issues`, `GET /stats`. Full schema at `/docs`.
-- **Cost** — the starter set is roughly 300 pages. Extraction is one call per chunk and
-  dominates; `FACTLAYER_MODEL=claude-haiku-4-5` cuts it substantially at some cost in
-  fact quality and in the judge's willingness to say "unrelated".
+- **Measured parsing** — all six starter PDFs, 511 pages, parse in 2.1 s total into 653
+  chunks. Only two of the six carry usable printed page labels, which is why the physical
+  page number is always stored as the fallback:
+
+  | Document | Pages | Chunks | Image-only pages |
+  | --- | ---: | ---: | ---: |
+  | delhivery prospectus 2022 | 100 | 125 | 1 |
+  | delhivery annual report FY24 | 100 | 214 | 0 |
+  | delhivery Q4 FY24 deck | 27 | 23 | 4 |
+  | economic survey 2024-25 | 89 | 91 | 0 |
+  | RBI annual report 2024-25 | 100 | 101 | 0 |
+  | IMF Article IV 2025 | 95 | 99 | 1 |
+
+- **Cost — read this before running all six.** Extraction is one call per chunk, so the
+  full corpus is 653 extraction calls plus roughly one judging call per grounded fact.
+  On `claude-opus-5` that is an estimated **$30–40 and 45–60 minutes** at the default
+  concurrency of 8. These are estimates from token counts, not a measured bill — I did
+  not have API credentials in the environment where this was built, so no end-to-end run
+  has been performed. Ingest one document first and check the numbers before committing
+  to the rest. `FACTLAYER_MODEL=claude-haiku-4-5` cuts the estimate to roughly a fifth,
+  at some cost in fact quality and in the judge's willingness to say "unrelated".
 - **`test_core.py` covers the parts that can actually be wrong** — page attribution,
   window overlap, the grounding check (including that a paraphrase and an altered number
   both fail it), candidate blocking across crore/billion wording, idempotent relinking,
