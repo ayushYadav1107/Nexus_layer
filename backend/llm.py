@@ -2,16 +2,20 @@
 
 The workload splits cleanly, so the models do too:
 
-  extraction  653 calls of mostly transcription and normalisation. A local 8B
-              model handles it, costs nothing, and can be re-run freely while
-              tuning the prompt.
+  extraction  hundreds of calls of mostly transcription and normalisation, so it
+              goes to the cheapest, fastest model that honours a JSON schema.
   judging     far fewer calls, but this is where corroborates / contradicts /
-              reconciled is actually decided. Worth a hosted model.
+              reconciled is actually decided. Worth a stronger model.
+
+A model being listed by `check_models.py --list` does NOT mean the key has free
+quota for it: gemini-3.8-flash lists fine and 429s on every call. Verified working
+on a free key are gemini-3.5-flash-lite, gemini-2.5-flash, gemini-3.1-flash-lite
+and gemini-flash-lite-latest.
 
 Configured as "provider:model" per role:
 
-  FACTLAYER_EXTRACT=ollama:llama3.1:8b
-  FACTLAYER_JUDGE=gemini:gemini-3.8-flash
+  FACTLAYER_EXTRACT=gemini:gemini-3.5-flash-lite
+  FACTLAYER_JUDGE=gemini:gemini-2.5-flash
 
 Either role also accepts anthropic:claude-sonnet-5. Providers are three small
 functions and a dict -- there is no plugin layer, and adding a fourth is a
@@ -32,8 +36,8 @@ from contextlib import asynccontextmanager
 
 import env  # noqa: F401  loads .env before the reads below
 
-EXTRACT_SPEC = os.environ.get("FACTLAYER_EXTRACT", "ollama:llama3.1:8b")
-JUDGE_SPEC = os.environ.get("FACTLAYER_JUDGE", "gemini:gemini-3.8-flash")
+EXTRACT_SPEC = os.environ.get("FACTLAYER_EXTRACT", "gemini:gemini-3.5-flash-lite")
+JUDGE_SPEC = os.environ.get("FACTLAYER_JUDGE", "gemini:gemini-2.5-flash")
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
 OLLAMA_TIMEOUT = int(os.environ.get("FACTLAYER_OLLAMA_TIMEOUT", "900"))
@@ -82,6 +86,16 @@ async def _gate(g):
         yield
 
 
+_HARD_QUOTA = ("perday", "per day", "daily", "generate_requests_per_model_per_day",
+               "free_tier_requests", "limit: 0")
+
+
+def _quota_is_exhausted(detail):
+    """True when a 429 names a limit that will not clear during this run."""
+    low = detail.lower()
+    return any(m in low for m in _HARD_QUOTA)
+
+
 def _post_sync(url, payload, headers, timeout):
     """POST JSON, retrying rate limits and transient failures. Runs on a thread."""
     body = json.dumps(payload).encode()
@@ -93,10 +107,17 @@ def _post_sync(url, payload, headers, timeout):
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", "replace")[:300]
+            detail = e.read().decode("utf-8", "replace")[:800]
             last = f"HTTP {e.code}: {detail}"
             if e.code not in (408, 409, 429, 500, 502, 503, 504) or attempt == 4:
                 raise LLMError(last)
+            # A per-day quota, or a model your key has no quota for at all, does
+            # not recover within a run. Retrying it five times with backoff turns
+            # a fast failure into ~30 wasted seconds per call -- which is how a
+            # 237-chunk document once spent 47 minutes producing nothing.
+            if e.code == 429 and _quota_is_exhausted(detail):
+                raise LLMError(last + "  (hard quota -- not retried; switch model "
+                                      "or wait for the daily reset)")
             # Honour Retry-After when the server sends one; otherwise back off.
             try:
                 delay = float(e.headers.get("Retry-After") or 0)
