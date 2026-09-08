@@ -1,4 +1,4 @@
-anthropic>=1.0
+anthropic>=1.0            # optional: only if a role is set to anthropic:
 fastapi>=0.115
 uvicorn[standard]>=0.30
 pymupdf>=1.24

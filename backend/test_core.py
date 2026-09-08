@@ -70,6 +70,68 @@ def test_grounding_check():
     assert not ingest.is_grounded("short", src), "too short to be evidence"
 
 
+def test_value_num_is_recomputed_not_trusted():
+    from extract import value_num_from_text as v
+    # The two errors llama3.1:8b actually made on the Delhivery deck.
+    assert v("Rs. 127 Cr") == 127 * 10**7, "crore is 10^7, not 10^6"
+    assert v("30%") == 30.0 and v("30%+") == 30.0, "a percentage is its own number"
+    # Indian and international magnitudes on the same page.
+    assert v("Rs. 7,225.29 million") == 7225.29e6
+    assert v("INR 7.2253 billion") == 7.2253e9
+    assert v("2.5 lakh") == 250000.0
+    # Accounting parentheses are a negative.
+    assert v("Rs. (452 Cr)") == -452 * 10**7
+    assert v("-1,008") == -1008.0
+    # Plain numbers and units that are not magnitudes.
+    assert v("57,000") == 57000.0
+    assert v("31 days") == 31.0
+    # Digits glued to letters are period tokens, not values. Before this rule
+    # "doubled over FY23," parsed as 23.0 and "PAT profitable in Q3" as 3.0,
+    # which is worse than no number at all -- it poisons numeric blocking.
+    assert v("doubled over FY23, strong Q4") is None
+    assert v("PAT profitable in Q3 FY24") is None
+    assert v("H1 growth") is None
+    # ...but a real value later in the string still wins over a leading period.
+    assert v("FY2024 revenue of Rs 500 Cr") == 500 * 10**7
+    # Semantic facts have no number, and must not invent one.
+    assert v("Sandeep Kumar Barasia, Executive Director") is None
+    assert v("") is None and v(None) is None
+
+
+def test_gemini_schema_translation():
+    # generateContent takes an OpenAPI-flavoured subset: no additionalProperties,
+    # and nullability as a flag rather than a ["string","null"] type union. This
+    # runs against the real schemas because it is the one Gemini-side behaviour
+    # that can be checked without a key.
+    import json as _json
+
+    import extract as _extract
+    import link as _link
+    from llm import _gemini_schema
+
+    def walk(node):
+        if isinstance(node, dict):
+            assert not isinstance(node.get("type"), list), f"type union survived: {node}"
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    for schema in (_extract.SCHEMA, _link.SCHEMA):
+        out = _gemini_schema(schema)
+        assert "additionalProperties" not in _json.dumps(out)
+        walk(out)
+
+    item = _gemini_schema(_extract.SCHEMA)["properties"]["facts"]["items"]
+    assert item["properties"]["value_num"] == {"type": "number", "nullable": True}
+    assert item["properties"]["entity"] == {"type": "string"}, "non-null stays plain"
+    assert item["required"], "required list must survive"
+    # enum lists are data, not type unions, and must not be mangled
+    verdict = _gemini_schema(_link.SCHEMA)["properties"]["verdicts"]["items"]
+    assert verdict["properties"]["relationship"]["enum"][0] == "corroborates"
+
+
 def seed():
     store.init()
     doc_a, _ = store.add_document("prospectus.pdf", "aaa")

@@ -213,7 +213,7 @@ async def judge(fact_id):
     user = "\n".join(parts)
 
     try:
-        data = await structured(SYSTEM, user, SCHEMA, effort="medium", max_tokens=4000)
+        data = await structured(SYSTEM, user, SCHEMA, role="judge", max_tokens=4000)
     except LLMError as e:
         return [], [{"kind": "llm_error", "detail": f"judge fact {fact_id}: {e}",
                      "page": anchor["page"]}]

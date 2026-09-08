@@ -14,8 +14,58 @@ Two ideas do most of the work here:
    crore" and "topline of INR 72.25 billion" find each other later without an
    embedding model.
 """
+import re
+
 import ingest
 from llm import LLMError, structured
+
+# Magnitude words, lowercase. Indian and international units both appear in these
+# documents, often on the same page.
+_MAGNITUDES = {
+    "crore": 1e7, "cr": 1e7, "crores": 1e7,
+    "lakh": 1e5, "lakhs": 1e5, "lac": 1e5,
+    "thousand": 1e3, "k": 1e3,
+    "million": 1e6, "mn": 1e6, "mln": 1e6,
+    "billion": 1e9, "bn": 1e9,
+    "trillion": 1e12, "tn": 1e12,
+}
+_NUMBER = re.compile(r"(\()?\s*(-?)\s*(\d[\d,]*(?:\.\d+)?)")
+
+
+def value_num_from_text(value_text):
+    """Recompute the canonical magnitude from the value as written.
+
+    Every model tested gets this wrong somewhere -- 8B models especially, but not
+    only them: "Rs. 127 Cr" comes back as 1.27e8 instead of 1.27e9, and "30%" as
+    0.3 instead of 30. It is pure arithmetic over a string, so it does not belong
+    in a prompt at all. Returns None when there is no number to parse, which is
+    the correct answer for a semantic fact.
+    """
+    if not value_text:
+        return None
+    for m in _NUMBER.finditer(value_text):
+        paren, sign, digits = m.groups()
+        # Digits glued to letters are a period token, not a value: the 23 in FY23,
+        # the 3 in Q3, the 1 in H1. Skip them or they poison numeric blocking.
+        start = m.start(3)
+        if start > 0 and value_text[start - 1].isalpha():
+            continue
+        try:
+            value = float(digits.replace(",", ""))
+        except ValueError:
+            continue
+        # Accounting parentheses mean negative: "Rs. (452 Cr)" is a loss.
+        if sign == "-" or (paren and ")" in value_text[m.start():]):
+            value = -value
+
+        tail = value_text[m.end():].lower()
+        if tail.lstrip().startswith("%"):
+            return value                   # a percentage is just its number
+        for word in re.findall(r"[a-z]+", tail)[:2]:
+            if word in _MAGNITUDES:
+                return value * _MAGNITUDES[word]
+        return value
+    return None
 
 SYSTEM = """You extract atomic, checkable facts from one excerpt of a business or \
 institutional document, for a knowledge layer that later cross-references facts \
@@ -76,6 +126,34 @@ quote       A VERBATIM span copied character-for-character from the excerpt that
 confidence  0.0-1.0. Lower it when the period or scope had to be inferred from layout,
             when the text is a garbled table, or when the subject is ambiguous.
 
+PERIOD AND SCOPE ARE THE TWO MOST COMMONLY MISSED FIELDS. They are rarely written
+inside the sentence you are quoting -- they come from the page around it:
+  - A page or section heading like "FY24 highlights" or "Q4 FY24 results" sets the
+    period for every fact on that page unless a fact states its own.
+  - A table column header like "March 31, 2024" sets the period for that column.
+  - A line prefixed with a segment, division or region name -- "PTL:", "Express Parcel:",
+    "Rural -" -- has that as its scope.
+  - Words like consolidated, standalone, provisional, revised, projected, estimated
+    anywhere nearby are the scope.
+Leave them null only when the document genuinely does not say. Guessing is wrong, but
+so is ignoring a heading three lines up.
+
+WORKED EXAMPLE
+Excerpt (page headed "FY24 highlights"):
+    TL: 40% YoY revenue growth with service EBITDA profitability improvement
+Correct output for that line:
+    entity      "Delhivery Limited"          <- full formal name, not "Delhivery"
+    attribute   "revenue_growth"
+    value_text  "40% YoY"
+    value_num   40                            <- the number itself, NOT 0.4
+    unit        "percent"
+    period      "FY2024"                      <- inherited from the page heading
+    scope       "Truckload (TL) segment"      <- from the line's own prefix
+    statement   "Delhivery Limited's Truckload segment grew revenue 40% year on year
+                 in FY2024."
+    quote       "TL: 40% YoY revenue growth with service EBITDA profitability improvement"
+    confidence  0.8                           <- period was inferred, so not 1.0
+
 Return only the JSON object."""
 
 SCHEMA = {
@@ -131,7 +209,7 @@ def _user(doc_name, chunk):
 async def extract_chunk(doc_name, chunk):
     """Returns (facts, issues). Never raises -- a bad chunk becomes an issue."""
     try:
-        data = await structured(SYSTEM, _user(doc_name, chunk), SCHEMA, effort="medium")
+        data = await structured(SYSTEM, _user(doc_name, chunk), SCHEMA, role="extract")
     except LLMError as e:
         return [], [{"kind": "llm_error", "detail": str(e), "page": chunk["page"]}]
 
@@ -149,11 +227,25 @@ async def extract_chunk(doc_name, chunk):
                 "page": chunk["page"],
                 "payload": {"quote": quote, "statement": raw.get("statement")},
             })
+        # Arithmetic beats instruction-following: trust the parsed magnitude over
+        # the model's, since numeric blocking in link.py depends on it being right.
+        # If value_text has digits but none of them is a value ("PAT profitable in
+        # Q3 FY24"), that is a non-numeric fact however confidently the model
+        # numbered it -- a spurious 3.0 is worse for blocking than no number.
+        value_text = raw.get("value_text") or ""
+        computed = value_num_from_text(value_text)
+        if computed is not None:
+            value_num = computed
+        elif any(ch.isdigit() for ch in value_text):
+            value_num = None
+        else:
+            value_num = raw.get("value_num")
+
         facts.append({
             "entity": (raw.get("entity") or "").strip(),
             "attribute": (raw.get("attribute") or "").strip().lower().replace(" ", "_"),
             "value_text": raw.get("value_text") or "",
-            "value_num": raw.get("value_num"),
+            "value_num": value_num,
             "unit": raw.get("unit"),
             "period": raw.get("period"),
             "scope": raw.get("scope"),

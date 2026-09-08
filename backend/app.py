@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import extract
 import ingest
 import link
+import llm
 import store
 
 MAX_UPLOAD = int(os.environ.get("FACTLAYER_MAX_UPLOAD_MB", "50")) * 1024 * 1024
@@ -65,16 +66,12 @@ async def process(doc_id, filename, pdf_bytes):
         store.set_doc_status(doc_id, "linking")
         # Judged in waves of 32 rather than all at once: facts stored by one wave are
         # candidates for the next, so a document's own internal contradictions get
-        # found without a second pass.
-        sem = asyncio.Semaphore(int(os.environ.get("FACTLAYER_CONCURRENCY", "8")))
-
-        async def one(fid):
-            async with sem:
-                return await link.judge(fid)
-
+        # found without a second pass. Concurrency and rate limiting live in llm.py,
+        # which is the only place that knows what each role is talking to.
         for batch_start in range(0, len(new_fact_ids), 32):
             batch = new_fact_ids[batch_start:batch_start + 32]
-            for verdicts, issues in await asyncio.gather(*(one(f) for f in batch)):
+            for verdicts, issues in await asyncio.gather(
+                    *(link.judge(f) for f in batch)):
                 for iss in issues:
                     store.add_issue(doc_id, iss.get("page"), iss["kind"], iss["detail"])
                 for v in verdicts:
@@ -255,5 +252,6 @@ def stats():
             "cross_doc_relations": one(
                 "SELECT COUNT(*) FROM relations WHERE cross_doc=1 AND kind!='unrelated'"),
             "issues": one("SELECT COUNT(*) FROM issues"),
+            "models": llm.describe(),
             "attributes": attrs,
         }

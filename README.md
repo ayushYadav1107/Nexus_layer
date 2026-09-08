@@ -9,14 +9,27 @@ context** (period, scope, units, vintage).
 
 ## Setup and Run Instructions
 
-Requirements: Python 3.11+, Node 18+, and an Anthropic API key.
+Requirements: Python 3.11+, Node 18+, and a model for each of the two roles.
+
+The default configuration runs **extraction locally on Ollama** (free, unlimited) and
+**judging on the Gemini free tier** (far fewer calls, and the reasoning that matters).
+Either role can be pointed anywhere — see Configuration.
+
+**Models**
+
+```bash
+# extraction, local and free
+ollama pull llama3.1:8b
+
+# judging: free key from https://aistudio.google.com/apikey
+export GEMINI_API_KEY=...                  # PowerShell: $env:GEMINI_API_KEY="..."
+```
 
 **Backend**
 
 ```bash
 cd backend
 pip install -r requirements.txt
-export ANTHROPIC_API_KEY=sk-ant-...        # Windows PowerShell: $env:ANTHROPIC_API_KEY="sk-ant-..."
 uvicorn app:app --port 8000
 ```
 
@@ -41,8 +54,8 @@ for f in path/to/starter-datasets/*/*.pdf; do
 done
 ```
 
-**Start with one document.** Extraction is one model call per chunk, so a full six-document
-run is not cheap — see Cost below.
+**Start with one document.** Extraction is one model call per chunk, and locally that is
+minutes per chunk — see Cost and the local-inference note below.
 
 **Run the self-check** (no API key, no network, no test framework):
 
@@ -52,13 +65,29 @@ cd backend && python test_core.py
 
 **Configuration** — all optional, all environment variables:
 
+Each role is set as `provider:model`, where provider is `ollama`, `gemini` or
+`anthropic`. Mix freely — the whole point of the split is that neither role is pinned.
+
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `ANTHROPIC_API_KEY` | — | required to ingest; the server still starts and serves existing results without it |
-| `FACTLAYER_MODEL` | `claude-opus-5` | set to `claude-haiku-4-5` for a much cheaper, noticeably shallower run |
-| `FACTLAYER_CONCURRENCY` | `8` | parallel model calls |
+| `FACTLAYER_EXTRACT` | `ollama:llama3.1:8b` | model for fact extraction (the many calls) |
+| `FACTLAYER_JUDGE` | `gemini:gemini-3.8-flash` | model for relation judging (the calls that matter) |
+| `GEMINI_API_KEY` | — | needed if either role is `gemini:` |
+| `ANTHROPIC_API_KEY` | — | needed if either role is `anthropic:` |
+| `FACTLAYER_JUDGE_RPM` | `14` | requests/min ceiling; keeps the Gemini free tier from 429ing |
+| `FACTLAYER_EXTRACT_CONCURRENCY` | `2` | parallel extraction calls |
+| `FACTLAYER_JUDGE_CONCURRENCY` | `2` | parallel judging calls |
+| `FACTLAYER_OLLAMA_CTX` | `8192` | Ollama context window; see the VRAM note below |
+| `OLLAMA_HOST` | `http://localhost:11434` | Ollama endpoint |
 | `FACTLAYER_DB` | `backend/factlayer.db` | SQLite file; delete it to reset the layer |
 | `FACTLAYER_MAX_UPLOAD_MB` | `50` | upload size cap |
+
+`GET /stats` reports which model each role resolved to, so the UI always shows what
+actually produced the results.
+
+Everything runs on free tiers with these defaults. If you have Anthropic credit, the
+best single-model setup is `FACTLAYER_EXTRACT=anthropic:claude-sonnet-5` and the same
+for `FACTLAYER_JUDGE`.
 
 ---
 
@@ -80,8 +109,12 @@ PDF ──► ingest.py ──► extract.py ──► link.py ──► SQLite 
                                       LLM judging    issues
 ```
 
-Five Python modules, one SQLite file, one page of UI. The pipeline runs as a background
+Six Python modules, one SQLite file, one page of UI. The pipeline runs as a background
 task on upload; the UI polls document status.
+
+`llm.py` is the only file that imports a model SDK or knows a provider exists; `extract.py`
+and `link.py` import one function from it. That is what makes the extraction/judging
+model split a config change rather than a rewrite.
 
 ### 1. Ingestion and grounding
 
@@ -99,8 +132,8 @@ skipped — an image-only page is a known blind spot, not an absence of facts.
 
 ### 2. Extraction
 
-One model call per chunk, constrained by a JSON schema (`output_config.format`). Each
-fact carries `entity`, `attribute`, `value_text`, `value_num`, `unit`, `period`, `scope`,
+One model call per chunk, constrained by a JSON schema — Ollama's `format`, Gemini's
+`responseSchema`, Anthropic's `output_config.format`. Each fact carries `entity`, `attribute`, `value_text`, `value_num`, `unit`, `period`, `scope`,
 free-form `qualifiers`, a self-contained `statement`, and a `quote`.
 
 Two decisions do most of the work:
@@ -114,9 +147,13 @@ guard against the most common failure mode here: a fluent paraphrase presented a
 quotation.
 
 **Normalisation happens at extraction time, not at match time.** The model emits a
-canonical `attribute` (`revenue_from_operations`, `real_gdp_growth`) and `value_num` in
-base units — crore and lakh expanded, magnitude words dropped — alongside the text as
-written. Pushing this into extraction is what lets retrieval stay simple downstream.
+canonical `attribute` (`revenue_from_operations`, `real_gdp_growth`) alongside the value
+as written. Pushing this into extraction is what lets retrieval stay simple downstream.
+
+The *magnitude*, though, is not left to the model. `value_num` is recomputed in Python
+from `value_text` — crore and lakh expanded, accounting parentheses read as negative,
+percentages kept as their own number — because every model tested got it wrong somewhere
+and numeric blocking depends on it. Arithmetic over a string does not belong in a prompt.
 
 `period` and `scope` are first-class columns because they are the fields that decide
 whether two different numbers are a contradiction or an artefact. Extracting them
@@ -207,11 +244,47 @@ candidate blocking, idempotent relinking, all API routes, and every UI tab inclu
 source-page verification, exercised against real pages from the Delhivery documents.
 `python test_core.py` covers the non-LLM logic: 8 checks, all passing.
 
-**Not run: a single live model call.** The environment this was built in had no Anthropic
-credentials, so extraction and judging quality — the actual substance of the system — is
-untested. The prompts are careful and the schemas are enforced, but no fact has been
-extracted and no relation judged. Treat the four cases as demonstrated by the plumbing,
-not yet by output, until you run it with a key.
+**Extraction has been run for real, on Ollama.** `llama3.1:8b` against page 5 of the Q4
+FY24 deck: 7 facts, **7/7 quotes verified grounded**, schema honoured exactly. What it
+gets wrong is the field discipline, not the structure:
+
+| | result |
+| --- | --- |
+| quotes grounded | 7/7 |
+| `period` populated | 5/7 |
+| `scope` populated | 3/7 |
+| `value_num` correct | 7/7 *after* the deterministic fix below |
+| time per chunk | ~117 s |
+
+Before the prompt carried a worked example, `period` and `scope` were **0/7** — the
+model filled the schema and ignored the instructions. Few-shot fixed most of it. What
+remains is a real ceiling: an 8B model leaves ~30% of periods and most scopes null, and
+those are precisely the fields the judge needs to tell a contradiction from a reporting
+difference.
+
+It also mis-normalised numbers every run — `Rs. 127 Cr` as 1.27e8 instead of 1.27e9,
+`30%` as 0.3 instead of 30. That is arithmetic over a string, so it was moved out of the
+prompt entirely into `extract.value_num_from_text`, which recomputes the magnitude from
+the value as written and overrides the model. It also refuses digits glued to letters,
+because "PAT profitable in Q3" was otherwise parsing as 3.0 — a spurious number is worse
+for numeric blocking than no number.
+
+**Not run: judging.** No Gemini key was available, so no relation has been classified.
+The request shape, the JSON-schema translation to Gemini's OpenAPI subset, and the
+rate-limit gate are all tested offline, but corroborates/contradicts/reconciled quality
+is unverified. Treat the four cases as demonstrated by the plumbing, not yet by output.
+
+**On running extraction locally at all.** `ollama ps` reports `32%/68% CPU/GPU` for
+llama3.1:8b at 8k context on a 6 GB RTX 4050 — the model does not fit, so a third of the
+layers run on CPU and generation is several times slower than it should be. At ~117 s per
+chunk, the 148-chunk deck+prospectus pair is 3–5 hours. If that matters more than the
+zero cost, put extraction on Gemini too — 653 calls fits inside the free tier's ~1,500
+requests/day:
+
+```bash
+export FACTLAYER_EXTRACT=gemini:gemini-3.8-flash
+export FACTLAYER_EXTRACT_RPM=14
+```
 
 **What does not work yet**
 
@@ -277,14 +350,20 @@ JSON errors, so the system's blind spots are a visible feature rather than a sil
   | RBI annual report 2024-25 | 100 | 101 | 0 |
   | IMF Article IV 2025 | 95 | 99 | 1 |
 
-- **Cost — read this before running all six.** Extraction is one call per chunk, so the
-  full corpus is 653 extraction calls plus roughly one judging call per grounded fact.
-  On `claude-opus-5` that is an estimated **$30–40 and 45–60 minutes** at the default
-  concurrency of 8. These are estimates from token counts, not a measured bill — I did
-  not have API credentials in the environment where this was built, so no end-to-end run
-  has been performed. Ingest one document first and check the numbers before committing
-  to the rest. `FACTLAYER_MODEL=claude-haiku-4-5` cuts the estimate to roughly a fifth,
-  at some cost in fact quality and in the judge's willingness to say "unrelated".
+- **Cost** — nothing, with the default configuration. Extraction runs locally on
+  Ollama and judging on the Gemini free tier (~15 requests/min, ~1,500/day), and the
+  in-process rate gate keeps the judge under that ceiling rather than discovering it via
+  429s. The binding constraint is time, not money: see the local-inference note above.
+
+  For reference, if you point both roles at Anthropic instead, the full six-document
+  corpus is roughly $80 on `claude-opus-5`, $32 on `claude-sonnet-5`, $12 on
+  `claude-haiku-4-5` — estimates from token counts, not a measured bill.
+
+  You almost certainly should not run all six documents. The four required cases are
+  best shown with the **Q4 FY24 earnings deck plus the 2022 prospectus**: two years
+  apart, so period-based reconciliation and changed-director contradictions arise
+  naturally, and cross-document links are guaranteed.
+
 - **`test_core.py` covers the parts that can actually be wrong** — page attribution,
   window overlap, the grounding check (including that a paraphrase and an altered number
   both fail it), candidate blocking across crore/billion wording, idempotent relinking,
