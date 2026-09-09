@@ -35,20 +35,15 @@ async def lifespan(_app):
     yield
 
 
-app = FastAPI(title="Fact Knowledge Layer", lifespan=lifespan)
+app = FastAPI(title="Nexus Layer", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
 # ---------------------------------------------------------------- pipeline
 
 async def _drain(tasks, on_result, doc_id, total):
-    """Consume tasks as they finish, persisting each one immediately.
-
-    Results are written per unit rather than after an asyncio.gather over the whole
-    document. Gathering first meant a 237-chunk run showed zero facts and zero
-    issues for its entire duration, so a silent API failure looked exactly like
-    healthy progress -- and cancelling left nothing behind at all.
-    """
+    """Consume tasks as they finish, persisting each one immediately, so progress
+    is visible mid-run and a cancel keeps whatever already landed."""
     done = 0
     try:
         for fut in asyncio.as_completed(tasks):
@@ -103,10 +98,8 @@ async def process(doc_id, filename, pdf_bytes):
                       for cid, c in zip(chunk_ids, chunks)],
                      keep, doc_id, len(chunks))
 
-        # A run where every call failed is not a finished document. Marking it
-        # "done" hid a total API failure behind a green badge and, because uploads
-        # dedupe on content, made it impossible to retry: re-uploading answered
-        # "duplicate" and the button appeared to do nothing.
+        # A run where every call failed is not a finished document, and marking it
+        # done would block the content-hash retry path.
         if not new_fact_ids and call_errors:
             store.set_doc_status(
                 doc_id, "failed",
@@ -125,10 +118,8 @@ async def process(doc_id, filename, pdf_bytes):
                 store.add_relation(v["a_id"], v["b_id"], v["kind"], v["confidence"],
                                    v["reasoning"], v["resolution"], v["cross_doc"])
 
-        # Judged in waves rather than all at once: facts stored by one wave are
-        # candidates for the next, so a document's own internal contradictions get
-        # found without a second pass. Concurrency and rate limiting live in llm.py,
-        # which is the only place that knows what each role is talking to.
+        # Waves rather than one batch: facts stored by one wave are candidates for
+        # the next, so a document's internal contradictions surface in one pass.
         judged = 0
         for start in range(0, len(new_fact_ids), 32):
             wave = new_fact_ids[start:start + 32]
@@ -140,8 +131,7 @@ async def process(doc_id, filename, pdf_bytes):
         store.set_doc_status(doc_id, "done")
         store.set_progress(doc_id, 0, 0)
     except asyncio.CancelledError:
-        # Stopped from the UI. Whatever was already extracted stays -- it is real,
-        # grounded and useful; only the unfinished remainder is dropped.
+        # Stopped from the UI; what was already extracted stays.
         store.set_doc_status(doc_id, "cancelled", error="stopped from the UI")
         store.set_progress(doc_id, 0, 0)
         raise
@@ -173,16 +163,15 @@ async def upload(file: UploadFile):
                                 (doc_id,)).fetchone()["status"]
             n_facts = con.execute("SELECT COUNT(*) c FROM facts WHERE doc_id=?",
                                   (doc_id,)).fetchone()["c"]
-        # "done" only blocks a retry if the run actually produced something. A run
-        # that finished with nothing is worth repeating, whatever it was labelled.
+        # "done" only blocks a retry if the run actually produced something.
         if prior == "done" and n_facts:
             return {"id": doc_id, "status": "duplicate",
                     "detail": f"already ingested - {n_facts} facts from this file"}
         # Uploads are deduplicated by content hash, so re-uploading is the natural
         # way to retry a run that failed or was stopped. Clear what it left behind.
         store.reset_document(doc_id)
-    # Keyed by document, both to hold a reference (asyncio keeps only a weak one,
-    # and a collected task would abandon the run) and so /cancel can find it.
+    # Keyed by document: holds a strong reference (asyncio keeps only a weak one)
+    # and lets /cancel find the task.
     task = asyncio.create_task(process(doc_id, file.filename, data))
     _running[doc_id] = task
     task.add_done_callback(lambda _t, d=doc_id: _running.pop(d, None))
@@ -252,8 +241,8 @@ def fact_detail(fact_id: int):
         if row is None:
             raise HTTPException(404, "no such fact")
         chunk = con.execute("SELECT text FROM chunks WHERE id=?", (row["chunk_id"],)).fetchone()
-        # Explicit aliases: `r.*, f.*` would collide on id/confidence/created_at and
-        # sqlite3.Row would silently keep whichever came last.
+        # Explicit aliases: `r.*, f.*` collide on id/confidence and sqlite3.Row
+        # silently keeps the last.
         rels = con.execute("""
             SELECT r.id AS relation_id, r.kind, r.confidence, r.reasoning, r.resolution,
                    r.cross_doc,

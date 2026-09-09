@@ -12,12 +12,8 @@ import pymupdf
 
 import env  # noqa: F401  loads .env before the reads below
 
-# Chars per chunk. This is the single biggest lever on how long a run takes,
-# because extraction is one model call per chunk: at 4000 most pages of a dense
-# report split in two, at 8000 most fit whole. Bigger chunks mean fewer calls and
-# no split context, at the cost of asking the model to read more at once -- worth
-# it on any model with a large context window. Page boundaries are still never
-# crossed, so page attribution is unaffected either way.
+# Chars per chunk -- the biggest lever on run time, since extraction is one call
+# per chunk. Page boundaries are never crossed either way.
 WINDOW = int(os.environ.get("FACTLAYER_CHUNK_CHARS", "4000"))
 OVERLAP = min(400, WINDOW // 10)
 MIN_TEXT = 80      # below this a page is treated as having no extractable text
@@ -83,21 +79,16 @@ def normalise(s):
     return re.sub(r"\s+", " ", s).strip().lower()
 
 
-MIN_QUOTE = 4          # below this a match is coincidence, not evidence
-UNAMBIGUOUS_AT = 15    # at or above this, one occurrence is enough
+MIN_QUOTE = 4
+UNAMBIGUOUS_AT = 15
 
 
 def is_grounded(quote, chunk_text):
     """True when the quote appears verbatim (modulo whitespace) in the chunk.
 
-    This is the cheap deterministic check that catches the most common LLM
-    failure here: a paraphrase presented as a quotation.
-
-    Length alone is the wrong bar. Slide decks and financial tables are full of
-    short but perfectly good evidence -- "YoY: 29.8%", "7,054" -- and a 15-char
-    floor rejected 73% of otherwise valid facts on the Delhivery deck. What makes
-    a short quote weak is ambiguity, not brevity, so a short one has to occur
-    exactly once in the chunk to count; a long one may repeat.
+    The bar is ambiguity, not length: slide and table evidence is legitimately
+    short ("YoY: 29.8%"), so a quote under UNAMBIGUOUS_AT must occur exactly once
+    in the chunk; a longer one may repeat.
     """
     q = normalise(quote)
     if len(q) < MIN_QUOTE:

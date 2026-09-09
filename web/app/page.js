@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 const api = (p) => fetch(`/api${p}`).then((r) => r.json());
 const LIVE = ["pending", "parsing", "extracting", "linking"];
@@ -129,17 +129,20 @@ function Fact({ f }) {
 
 /** The pipeline as a funnel of real counts. Doubles as an explanation of what the
  *  system does, which is most of what the page needed to stop feeling empty. */
-function Funnel({ s }) {
+function Funnel({ s, onPick }) {
   const stages = [
     { n: s.chunks, label: "chunks", note: "page-anchored" },
-    { n: s.facts, label: "facts", note: "extracted" },
-    { n: s.grounded, label: "grounded", note: "quote verified" },
-    { n: s.linked, label: "relations", note: "cross-referenced" },
+    { n: s.facts, label: "facts", note: "extracted", go: "facts" },
+    { n: s.grounded, label: "grounded", note: "quote verified", go: "facts" },
+    { n: s.linked, label: "relations", note: "cross-referenced", go: "corroborates" },
   ];
   return (
     <div className="funnel">
       {stages.map((st, i) => (
-        <div className="stage" key={st.label}>
+        <div className={`stage${st.go ? " go" : ""}`} key={st.label}
+             onClick={st.go ? () => onPick(st.go) : undefined}
+             role={st.go ? "button" : undefined} tabIndex={st.go ? 0 : undefined}
+             onKeyDown={(e) => st.go && (e.key === "Enter" || e.key === " ") && onPick(st.go)}>
           <b>{nf.format(st.n ?? 0)}</b>
           <span>{st.label}</span>
           <em>{st.note}</em>
@@ -151,7 +154,7 @@ function Funnel({ s }) {
 }
 
 /** Status, so both segments carry a text label -- identity is never colour alone. */
-function GroundingBar({ grounded, ungrounded }) {
+function GroundingBar({ grounded, ungrounded, onPick }) {
   const total = grounded + ungrounded;
   if (!total) return null;
   const pct = Math.round((grounded / total) * 100);
@@ -166,8 +169,12 @@ function GroundingBar({ grounded, ungrounded }) {
         <i className="bad" style={{ flex: ungrounded }} />
       </div>
       <div className="legend">
-        <span><i className="sw ok" />{nf.format(grounded)} quote found verbatim</span>
-        <span><i className="sw bad" />{nf.format(ungrounded)} unverified — quarantined</span>
+        <button className="legrow" onClick={() => onPick("facts")}>
+          <i className="sw ok" />{nf.format(grounded)} quote found verbatim
+        </button>
+        <button className="legrow" onClick={() => onPick("issues")}>
+          <i className="sw bad" />{nf.format(ungrounded)} unverified — quarantined
+        </button>
       </div>
     </div>
   );
@@ -242,6 +249,7 @@ export default function Home() {
   const [err, setErr] = useState("");
   const [notice, setNotice] = useState("");
   const [tick, setTick] = useState(0);
+  const resultsRef = useRef(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -317,6 +325,29 @@ export default function Home() {
     }
   }
 
+  /** Switch tab and bring the results into view — the tabs sit below the fold, so
+   *  changing the tab alone looks like nothing happened.
+   *
+   *  Deliberately not requestAnimationFrame: it never fires while the tab is
+   *  hidden, which silently disables the scroll. A timeout still runs, and
+   *  smooth scrolling is itself a no-op in some embedded browsers, so the
+   *  position is verified and jumped outright if it did not take.
+   */
+  function show(next) {
+    setView(next);
+    setTimeout(() => {
+      const el = resultsRef.current;
+      if (!el) return;
+      const target = el.getBoundingClientRect().top + window.scrollY - 12;
+      const reduce = typeof matchMedia === "function"
+        && matchMedia("(prefers-reduced-motion: reduce)").matches;
+      window.scrollTo({ top: target, behavior: reduce ? "auto" : "smooth" });
+      setTimeout(() => {
+        if (Math.abs(window.scrollY - target) > 40) window.scrollTo(0, target);
+      }, 500);
+    }, 0);
+  }
+
   const rel = stats?.relations || {};
   const counts = {
     corroborates: rel.corroborates || 0,
@@ -333,16 +364,37 @@ export default function Home() {
 
   return (
     <main className="wrap">
-      <header className="hero">
-        <h1>Nexus Layer</h1>
-        <p className="sub">
-          Facts extracted from PDFs, each pinned to a verbatim quote on a specific page,
-          then cross-referenced against every fact already in the layer — corroborating,
-          contradicting, or reconciled by context.
-        </p>
-      </header>
+      <div className="sky" aria-hidden="true" />
 
-      <div className="card">
+      <nav className="nav">
+        <div className="brand"><span className="mark" aria-hidden="true" />Nexus Layer</div>
+        <div className="navlinks">
+          <span>Grounded extraction</span>
+          <span>Cross-document reconciliation</span>
+          <span>Evidence you can check</span>
+        </div>
+      </nav>
+
+      <h1 className="hero">Every fact, back to its page</h1>
+      <p className="sub">
+        Facts extracted from PDFs, each pinned to a verbatim quote on a specific page, then
+        cross-referenced against everything already in the layer — corroborating,
+        contradicting, or reconciled by context.
+      </p>
+
+      <div className="herorow">
+        <label className="filebtn dot-lead">
+          {busy ? "Uploading…" : "Upload PDFs"}
+          <input type="file" accept="application/pdf" multiple onChange={upload} disabled={busy} />
+        </label>
+        {stats?.facts > 0 && (
+          <button className="dot-lead" onClick={() => show("facts")}>
+            Browse {nf.format(stats.grounded)} facts
+          </button>
+        )}
+      </div>
+
+      <div className="console">
         <div className="spread">
           <div className="stats">
             <div className="stat"><b>{stats?.documents ?? "—"}</b><span>documents</span></div>
@@ -350,10 +402,6 @@ export default function Home() {
             <div className="stat"><b>{nf.format(stats?.cross_doc_relations ?? 0)}</b><span>cross-doc links</span></div>
             <div className="stat"><b>{stats?.attributes?.length ?? "—"}</b><span>fact types</span></div>
           </div>
-          <label className="filebtn">
-            {busy ? "Uploading…" : "Upload PDFs"}
-            <input type="file" accept="application/pdf" multiple onChange={upload} disabled={busy} />
-          </label>
         </div>
 
         {stats?.models && (
@@ -367,7 +415,8 @@ export default function Home() {
         {notice && <p className="notice">{notice}</p>}
 
         {stats?.facts > 0 && (
-          <Funnel s={{ chunks, facts: stats.facts, grounded: stats.grounded, linked }} />
+          <Funnel s={{ chunks, facts: stats.facts, grounded: stats.grounded, linked }}
+                  onPick={show} />
         )}
       </div>
 
@@ -397,12 +446,12 @@ export default function Home() {
 
       {stats?.facts > 0 && (
         <div className="panels">
-          <GroundingBar grounded={stats.grounded} ungrounded={ungrounded} />
+          <GroundingBar grounded={stats.grounded} ungrounded={ungrounded} onPick={show} />
           <AttributeBars attributes={stats.attributes} />
         </div>
       )}
 
-      <div className="secthead">
+      <div className="secthead" ref={resultsRef}>
         <h2>Cross-references</h2>
         {docId && <span className="meta">within {selectedName}</span>}
       </div>
