@@ -21,7 +21,7 @@ erDiagram
     text filename
     text sha256 UK "upload dedupe"
     int  n_pages
-    text status "pending|parsing|extracting|linking|done|failed|cancelled|interrupted"
+    text status "pending through done, or failed"
     text error
     int  done "progress in current phase"
     int  total
@@ -49,14 +49,14 @@ erDiagram
     text  statement
     text  quote "verbatim span"
     int   page
-    int   grounded "0 = quarantined"
+    int   grounded "0 means quarantined"
     real  confidence
   }
   RELATIONS {
     int  id PK
-    int  a_id FK "a < b, normalised"
+    int  a_id FK "lower id, normalised"
     int  b_id FK
-    text kind "corroborates|contradicts|reconciled|unrelated"
+    text kind "corroborates, contradicts, reconciled, unrelated"
     real confidence
     text reasoning
     text resolution "non-null for reconciled"
@@ -66,7 +66,7 @@ erDiagram
     int  id PK
     int  doc_id FK
     int  page
-    text kind "no_text|ungrounded_quote|llm_error|pipeline_error"
+    text kind "no_text, ungrounded_quote, llm_error"
     text detail
     text payload "JSON"
   }

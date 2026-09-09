@@ -75,8 +75,8 @@ sequenceDiagram
 
   U->>A: POST /documents (PDF)
   A->>D: insert document (sha256 dedupe)
-  A-->>U: {id, status: pending}
-  Note over A: background task; UI polls /documents
+  A-->>U: id plus status pending
+  Note over A: runs as a background task, UI polls /documents
 
   A->>A: ingest.parse → chunks
   A->>D: insert chunks, no_text issues
